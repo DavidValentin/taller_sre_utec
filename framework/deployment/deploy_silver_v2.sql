@@ -23,3 +23,7 @@ CREATE TABLE IF NOT EXISTS gameday.gold_contactables_por_pais (
     pct_contactables DOUBLE,
     updated_ts TIMESTAMP
 );
+
+-- Política FinOps: asignar owner y cost center a la tabla Gold para reporte de costos
+ALTER TABLE gameday.gold_contactables_por_pais
+  SET TAGS ('owner' = 'marketing', 'cost_center' = 'CC-1020', 'consumer' = 'marketing');
