@@ -6,7 +6,7 @@
 
 ## Resumen
 
-El viernes por la tarde se introdujo un error en el catálogo de países (`data/ref/paises.csv`) asignando el país "Perú" y región "Andina" al código "CL" (Chile). Al cargarse el lote de clientes del viernes, los nuevos clientes de Chile quedaron registrados como de Perú en la tabla Silver v2 y agregados a Perú en la tabla Gold, provocando que en la mañana del lunes Marketing enviara la campaña de Perú a clientes chilenos y que la campaña de Chile saliera incompleta.
+El viernes por la tarde se introdujo un error en el catálogo de países (`data/ref/paises.csv`) asignando el país "Perú" y región "Andina" al código "CL" (Chile). Al cargarse el lote de clientes del viernes, los nuevos clientes de Chile quedaron registrados como de Perú en la tabla Silver v2 y agregados a Perú en la tabla Gold, provocando que en la mañana del lunes Marketing enviara la campaña de Perú a clientes chilenos y que la campaña de Chile saliera incompleta. Se contuvo reteniendo el lote del lunes, se corrigieron los datos en Silver mediante SQL y se revirtió el error en el repositorio vía PR, recuperando el pipeline con 55/55 puntos técnicos en un MTTR de 56.1 minutos.
 
 ## Impacto
 
@@ -33,9 +33,11 @@ El viernes por la tarde se introdujo un error en el catálogo de países (`data/
 | 2026-11-02 01:30:59 UTC | 2026-11-01 20:30:59 (-05:00) | **Inicio del incidente** registrado en `ops_event_log` (`run_id: 41372389743`, stage: `incidente_inicio`). |
 | 2026-11-02 01:34:00 UTC | 2026-11-01 20:34:00 (-05:00) | **Detectamos la causa raíz y el cambio culpable** (commit `3915bc8` / merge `9ad2866`). |
 | 2026-11-02 01:45:00 UTC | 2026-11-01 20:45:00 (-05:00) | **Contención**: Se decide retener el lote del lunes en `data/incoming/` y NO cargarlo aún para evitar corromper a 3 nuevos clientes de Chile (`CL`). Se avisa a Marketing para pausar la campaña de la tarde. |
-| [ ... ] | [ ... ] | [ primer verificar en verde ] |
+| 2026-11-02 02:03:00 UTC | 2026-11-01 21:03:00 (-05:00) | **Corrección de datos**: Se ejecutan sentencias `UPDATE` en Databricks para corregir los clientes de Chile en `silver_customers_v2` y el catálogo en `ref_paises`. |
+| 2026-11-02 02:07:00 UTC | 2026-11-01 21:07:00 (-05:00) | **Fix y PR**: Se abre PR con la corrección de `data/ref/paises.csv` y el movimiento del lote `customers_lunes.csv` a `data/source/`. Se mergea a `main`. |
+| 2026-11-02 02:27:05 UTC | 2026-11-01 21:27:05 (-05:00) | **Primer verificar en verde**: Ejecución de `Game day – Verificar` exitosa con **55/55 puntos técnicos** (Recuperar: 25/25, Sin duplicar: 15/15, Contener: 15/15). |
 
-**MTTR:** [ minutos desde el inicio del incidente hasta el primer verificar en verde ]
+**MTTR:** 56.1 minutos (desde las 01:30:59 UTC hasta las 02:27:05 UTC)
 
 ## Causa raíz
 
@@ -49,10 +51,23 @@ El viernes por la tarde se introdujo un error en el catálogo de países (`data/
 
 ## Qué funcionó y qué no
 
-- [ ... ]
+- **Qué funcionó:**
+  - La trazabilidad con `ops_event_log` y Delta Lake Time Travel (`DESCRIBE HISTORY`) permitió identificar con precisión exacta la versión y el commit donde se introdujo el error.
+  - La decisión oportuna de contención (no cargar el lote del lunes) evitó que se corrompieran 3 clientes chilenos adicionales y aseguró los 15 puntos de contención.
+  - La corrección de datos in-place con `UPDATE` en Silver corrigió los registros afectados sin duplicar datos ni requerir reprocesamiento destructivo.
+- **Qué no funcionó:**
+  - No había validaciones automáticas de calidad de datos (Data Quality Checks) que impidieran que inconsistencias entre código y nombre de país avanzaran a Gold.
+  - No había validación a nivel de Pull Request (CI) para cambios en archivos maestros de referencia (`ref_paises.csv`).
+  - La falta de una cláusula `WHEN MATCHED THEN UPDATE` en `load_silver.sql` impidió que un reproceso corrigiera automáticamente clientes existentes.
 
 ## Acción preventiva
 
-- Check nuevo en `framework/validation/validate_silver.py`: [ ¿qué valida? ]
-- ¿Lo probaron? ¿Falla si vuelven a aplicar el cambio del viernes? [ sí / no ]
-- Otras acciones (con dueño y fecha): [ ... ]
+- **Check nuevo en `framework/validation/validate_silver.py`:**
+  - Se agregó la validación `country_consistency_check` que ejecuta una consulta SQL verificando que ningún cliente en `silver_customers_v2` tenga `country_name` nulo o una discordancia entre su código ISO (`country_code`) y su nombre canónico (`country_name`), como por ejemplo `country_code = 'CL' AND country_name != 'Chile'`.
+  - A diferencia de los checks informativos anteriores, si `country_mismatch > 0`, el script registra el fallo con estatus `FAIL` en `gameday.ops_dq_results` y **aborta el pipeline inmediatamente con código de salida 1 (`sys.exit(1)`)**, bloqueando la ejecución del stage `gold` y evitando la publicación de datos corruptos a Marketing.
+- **¿Lo probaron? ¿Falla si vuelven a aplicar el cambio del viernes?**
+  - **Sí.** Si se reintroduce el error del viernes (`CL -> Perú`), cualquier inserción de clientes chilenos genera registros con `country_code = 'CL'` y `country_name = 'Perú'`. La consulta detecta `country_mismatch > 0`, hace fallar el paso `validation` en GitHub Actions y detiene el flujo antes de que corra el stage `gold`.
+- **Otras acciones (con dueño y fecha):**
+  - **Pruebas unitarias de catálogos en CI (PR):** Agregar un test en `framework/tests/test_dataset.py` que valide la integridad de `data/ref/paises.csv` (códigos ISO únicos, nombres no duplicados) antes del merge. *Dueño: Edgar. Fecha: 2026-11-06.*
+  - **Mejora en la sentencia MERGE:** Actualizar `load_silver.sql` para incluir una cláusula `WHEN MATCHED AND (t.country_name != s.country_name OR t.region != s.region) THEN UPDATE SET ...` para que actualizaciones legítimas en los catálogos maestros sincronicen los datos de clientes ya existentes en reprocesos. *Dueño: David. Fecha: 2026-11-08.*
+  - **Monitoreo de alertas automáticas:** Configurar alertas en Databricks SQL Alerts sobre `ops_dq_results` cuando algún check reporte `FAIL`, notificando inmediatamente a un canal de Slack/Teams del equipo de datos. *Dueño: Juancarlos. Fecha: 2026-11-10.*
