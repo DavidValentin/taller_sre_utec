@@ -1,4 +1,5 @@
 import os
+import sys
 from databricks import sql
 from datetime import datetime, timezone
 
@@ -24,6 +25,17 @@ def main():
             name_null = fetch_one(cur, f"SELECT COUNT(*) FROM {SILVER_TABLE} WHERE dq_is_name_null = true")
             underage = fetch_one(cur, f"SELECT COUNT(*) FROM {SILVER_TABLE} WHERE dq_is_underage = true")
 
+            # Check preventivo: Consistencia de país y región según estándar ISO
+            # Frena el pipeline si algún cliente tiene mapeo erróneo o país nulo (ej. CL mapeado a Perú)
+            country_mismatch = fetch_one(cur, f"""
+                SELECT COUNT(*) FROM {SILVER_TABLE}
+                WHERE country_name IS NULL
+                   OR (country_code = 'CL' AND country_name != 'Chile')
+                   OR (country_code = 'PE' AND country_name != 'Perú')
+                   OR (country_code = 'AR' AND country_name != 'Argentina')
+                   OR (country_code = 'CO' AND country_name != 'Colombia')
+            """)
+
             # Guarda resultados en ops_dq_results
             cur.execute(
                 "INSERT INTO gameday.ops_dq_results VALUES (?, current_timestamp(), ?, 'total_rows', 'INFO', ?, ?)",
@@ -40,7 +52,16 @@ def main():
                 (RUN_ID, SILVER_TABLE, "WARN" if underage > 0 else "PASS", float(underage), "age < 18")
             )
 
-    print(f"✅ Validation completed: total={total}, name_null={name_null}, underage={underage}")
+            cur.execute(
+                "INSERT INTO gameday.ops_dq_results VALUES (?, current_timestamp(), ?, 'country_consistency_check', ?, ?, ?)",
+                (RUN_ID, SILVER_TABLE, "FAIL" if country_mismatch > 0 else "PASS", float(country_mismatch), "country_code vs country_name mismatch or null")
+            )
+
+    print(f"✅ Validation completed: total={total}, name_null={name_null}, underage={underage}, country_mismatch={country_mismatch}")
+
+    if country_mismatch > 0:
+        print(f"❌ DQ Error: {country_mismatch} registro(s) con inconsistencia de país en {SILVER_TABLE}. Frenando pipeline antes de Gold.", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
